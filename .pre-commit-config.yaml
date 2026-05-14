@@ -1,0 +1,52 @@
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-yaml
+      - id: check-toml
+      - id: check-merge-conflict
+      - id: check-added-large-files
+
+  - repo: local
+    hooks:
+      - id: cargo-fmt
+        name: cargo fmt
+        description: Format Rust code with rustfmt (check only).
+        entry: cargo fmt --all -- --check
+        language: system
+        types: [rust]
+        pass_filenames: false
+
+      - id: cargo-check
+        name: cargo check
+        description: Type-check all targets and features.
+        entry: cargo check --all-targets --all-features --locked
+        language: system
+        types: [rust]
+        pass_filenames: false
+
+      - id: cargo-clippy
+        name: cargo clippy (strict)
+        description: Run clippy with strict lints; warnings denied.
+        entry: cargo clippy --all-targets --all-features --locked -- -D warnings
+        language: system
+        types: [rust]
+        pass_filenames: false
+
+      - id: cargo-test
+        name: cargo test
+        description: Run the test suite.
+        entry: cargo test --all-targets --all-features --locked
+        language: system
+        types: [rust]
+        pass_filenames: false
+
+      - id: cargo-doc
+        name: cargo doc
+        description: Build docs; warnings denied.
+        entry: bash -c 'RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features --locked'
+        language: system
+        types: [rust]
+        pass_filenames: false
