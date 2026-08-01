@@ -86,6 +86,11 @@ fn invoke(
     let fake_ps = write_fake_ps(root.path());
     let lifecycle = root.path().join("lifecycle.jsonl");
     let descendant_pid_file = root.path().join("descendant.pid");
+    let inference_seconds = if matches!(mode, "no-output" | "never-quiescent" | "exit-early") {
+        "2"
+    } else {
+        "5"
+    };
     let started = Instant::now();
     let output = Command::new(env!("CARGO_BIN_EXE_claude-pee"))
         .env("CLAUDE_PEE_EXEC", fake)
@@ -110,7 +115,7 @@ fn invoke(
             "--second-opinion-lifecycle",
             lifecycle.to_str().unwrap(),
             "--second-opinion-inference-seconds",
-            "2",
+            inference_seconds,
             "--second-opinion-normal-cleanup-seconds",
             "1",
             "--second-opinion-forced-cleanup-seconds",
