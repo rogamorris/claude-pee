@@ -162,12 +162,14 @@ fn run() -> Result<u8, BoxError> {
             let mut tree_tracking_failed = false;
 
             loop {
-                if !prompt_emitted && prompt_rx.try_recv().is_ok() {
+                if cleanup_started.is_none() && !prompt_emitted && prompt_rx.try_recv().is_ok() {
                     lifecycle.emit(Phase::PromptSubmitted, None, "")?;
                     prompt_emitted = true;
                 }
 
-                while let Ok(observation) = observation_rx.try_recv() {
+                while cleanup_started.is_none()
+                    && let Ok(observation) = observation_rx.try_recv()
+                {
                     if !prompt_emitted && prompt_rx.recv_timeout(Duration::from_millis(50)).is_ok()
                     {
                         lifecycle.emit(Phase::PromptSubmitted, None, "")?;
@@ -253,6 +255,26 @@ fn run() -> Result<u8, BoxError> {
                     && cleanup_started.is_none()
                     && start.elapsed() > second_opinion.inference
                 {
+                    stop.store(true, Ordering::Relaxed);
+                    thread::sleep(Duration::from_millis(120));
+                    while let Ok(observation) = observation_rx.try_recv() {
+                        if !prompt_emitted
+                            && prompt_rx.recv_timeout(Duration::from_millis(50)).is_ok()
+                        {
+                            lifecycle.emit(Phase::PromptSubmitted, None, "")?;
+                            prompt_emitted = true;
+                        }
+                        if !output_emitted {
+                            lifecycle.emit(Phase::OutputObserved, None, "")?;
+                            output_emitted = true;
+                        }
+                        if transcript::completed_within(&observation, second_opinion.inference)
+                            && review.is_none()
+                        {
+                            lifecycle.emit(Phase::OutputComplete, None, "")?;
+                            review = Some(observation.text);
+                        }
+                    }
                     lifecycle.emit(Phase::CleanupStarted, None, "inference_deadline")?;
                     cleanup_started = Some(Instant::now());
                     forced = true;
