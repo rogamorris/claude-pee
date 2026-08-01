@@ -197,5 +197,12 @@ fn final_drain_recovers_terminal_output_written_immediately_before_exit() {
         "Completed review\n"
     );
     assert!(records.contains("\"outcome\":\"completed_clean\""));
+    let output_complete = records
+        .find("\"phase\":\"output_complete\"")
+        .expect("output_complete record");
+    let cleanup_started = records
+        .find("\"phase\":\"cleanup_started\"")
+        .expect("cleanup_started record");
+    assert!(output_complete < cleanup_started);
     assert!(elapsed < Duration::from_secs(3));
 }

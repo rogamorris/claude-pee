@@ -177,10 +177,6 @@ fn run() -> Result<u8, BoxError> {
                 }
 
                 if child_exit_code.is_some() && child::process_group_absent(process_id)? {
-                    if cleanup_started.is_none() {
-                        lifecycle.emit(Phase::CleanupStarted, None, "child_exited")?;
-                        cleanup_started = Some(Instant::now());
-                    }
                     stop.store(true, Ordering::Relaxed);
                     thread::sleep(Duration::from_millis(120));
                     while let Ok(observation) = observation_rx.try_recv() {
@@ -202,6 +198,9 @@ fn run() -> Result<u8, BoxError> {
                             }
                             review = Some(observation.text);
                         }
+                    }
+                    if cleanup_started.is_none() {
+                        lifecycle.emit(Phase::CleanupStarted, None, "child_exited")?;
                     }
                     let result = match (review.as_ref(), forced, forced_error) {
                         (Some(_), false, false) => Outcome::CompletedClean,
