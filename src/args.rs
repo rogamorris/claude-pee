@@ -29,6 +29,7 @@ impl FromStr for OutputFormat {
 pub enum ParseError {
     MissingValue(&'static str),
     InvalidOutputFormat(String),
+    InvalidPositiveInteger(&'static str, String),
 }
 
 impl fmt::Display for ParseError {
@@ -39,6 +40,9 @@ impl fmt::Display for ParseError {
                 f,
                 "invalid --output-format value {v:?}; expected one of: text, stream-json, json"
             ),
+            Self::InvalidPositiveInteger(flag, value) => {
+                write!(f, "invalid positive integer for {flag}: {value:?}")
+            }
         }
     }
 }
@@ -50,12 +54,34 @@ pub struct ParsedArgs {
     pub inject: Option<String>,
     pub forwarded: Vec<OsString>,
     pub output_format: OutputFormat,
+    pub capabilities: bool,
+    pub run_id: Option<String>,
+    pub lifecycle_path: Option<OsString>,
+    pub inference_seconds: Option<u64>,
+    pub normal_cleanup_seconds: u64,
+    pub forced_cleanup_seconds: u64,
+}
+
+fn positive_integer(value: OsString, flag: &'static str) -> Result<u64, ParseError> {
+    let text = value
+        .into_string()
+        .unwrap_or_else(|value| value.to_string_lossy().into_owned());
+    text.parse::<u64>()
+        .ok()
+        .filter(|value| *value > 0)
+        .ok_or(ParseError::InvalidPositiveInteger(flag, text))
 }
 
 pub fn parse<I: IntoIterator<Item = OsString>>(argv: I) -> Result<ParsedArgs, ParseError> {
     let mut inject: Option<String> = None;
     let mut forwarded: Vec<OsString> = Vec::new();
     let mut output_format = OutputFormat::Text;
+    let mut capabilities = false;
+    let mut run_id = None;
+    let mut lifecycle_path = None;
+    let mut inference_seconds = None;
+    let mut normal_cleanup_seconds = 10;
+    let mut forced_cleanup_seconds = 5;
     let mut iter = argv.into_iter();
     while let Some(arg) = iter.next() {
         match arg.to_str() {
@@ -74,6 +100,45 @@ pub fn parse<I: IntoIterator<Item = OsString>>(argv: I) -> Result<ParsedArgs, Pa
             Some(s) if let Some(rest) = s.strip_prefix("--output-format=") => {
                 output_format = rest.parse()?;
             }
+            Some("--second-opinion-capabilities") => capabilities = true,
+            Some("--second-opinion-run-id") => {
+                run_id = Some(
+                    iter.next()
+                        .ok_or(ParseError::MissingValue("--second-opinion-run-id"))?
+                        .to_string_lossy()
+                        .into_owned(),
+                );
+            }
+            Some("--second-opinion-lifecycle") => {
+                lifecycle_path = Some(
+                    iter.next()
+                        .ok_or(ParseError::MissingValue("--second-opinion-lifecycle"))?,
+                );
+            }
+            Some("--second-opinion-inference-seconds") => {
+                inference_seconds = Some(positive_integer(
+                    iter.next().ok_or(ParseError::MissingValue(
+                        "--second-opinion-inference-seconds",
+                    ))?,
+                    "--second-opinion-inference-seconds",
+                )?);
+            }
+            Some("--second-opinion-normal-cleanup-seconds") => {
+                normal_cleanup_seconds = positive_integer(
+                    iter.next().ok_or(ParseError::MissingValue(
+                        "--second-opinion-normal-cleanup-seconds",
+                    ))?,
+                    "--second-opinion-normal-cleanup-seconds",
+                )?;
+            }
+            Some("--second-opinion-forced-cleanup-seconds") => {
+                forced_cleanup_seconds = positive_integer(
+                    iter.next().ok_or(ParseError::MissingValue(
+                        "--second-opinion-forced-cleanup-seconds",
+                    ))?,
+                    "--second-opinion-forced-cleanup-seconds",
+                )?;
+            }
             _ => forwarded.push(arg),
         }
     }
@@ -81,6 +146,12 @@ pub fn parse<I: IntoIterator<Item = OsString>>(argv: I) -> Result<ParsedArgs, Pa
         inject,
         forwarded,
         output_format,
+        capabilities,
+        run_id,
+        lifecycle_path,
+        inference_seconds,
+        normal_cleanup_seconds,
+        forced_cleanup_seconds,
     })
 }
 
@@ -191,5 +262,36 @@ mod tests {
     fn output_format_missing_value_errors() {
         let err = parse(osv(&["--output-format"])).unwrap_err();
         assert!(matches!(err, ParseError::MissingValue("--output-format")));
+    }
+
+    #[test]
+    fn second_opinion_flags_are_owned_and_not_forwarded() {
+        let parsed = parse(osv(&[
+            "--second-opinion-run-id",
+            "run-123",
+            "--second-opinion-lifecycle",
+            "/tmp/lifecycle.jsonl",
+            "--second-opinion-inference-seconds",
+            "300",
+            "--second-opinion-normal-cleanup-seconds",
+            "10",
+            "--second-opinion-forced-cleanup-seconds",
+            "5",
+            "--model",
+            "claude-fable-5",
+        ]))
+        .unwrap();
+        assert_eq!(parsed.run_id.as_deref(), Some("run-123"));
+        assert_eq!(parsed.inference_seconds, Some(300));
+        assert_eq!(parsed.normal_cleanup_seconds, 10);
+        assert_eq!(parsed.forced_cleanup_seconds, 5);
+        assert_eq!(parsed.forwarded, osv(&["--model", "claude-fable-5"]));
+    }
+
+    #[test]
+    fn capabilities_flag_is_owned() {
+        let parsed = parse(osv(&["--second-opinion-capabilities"])).unwrap();
+        assert!(parsed.capabilities);
+        assert!(parsed.forwarded.is_empty());
     }
 }

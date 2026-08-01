@@ -11,6 +11,12 @@ A drop-in front-end for the [`claude`](https://docs.claude.com/en/docs/claude-co
 
 Termination is driven by claude's own **Stop hook** — no flaky screen-idle heuristics. When claude finishes a turn, the hook touches a sentinel file; claude-pee sees it, sends `/exit`, and exits with the child's status code.
 
+For coordinated one-shot reviews, an opt-in lifecycle mode distinguishes
+semantic completion from session cleanup. It recognizes completion only from a
+terminal assistant transcript message with `stop_reason: "end_turn"` and
+non-empty visible text, then bounds and verifies cleanup before releasing the
+review on stdout.
+
 ## Install
 
 ```bash
@@ -53,6 +59,12 @@ Owned by claude-pee (consumed, never forwarded):
 | --- | --- |
 | `-p PROMPT` / `-p=PROMPT` | One-shot prompt to inject. Triggers auto-`/exit` after claude responds. |
 | `--output-format text\|json\|stream-json` | What to print on stdout. Default `text`. |
+| `--second-opinion-capabilities` | Print the content-free lifecycle capability JSON and exit without spawning Claude. |
+| `--second-opinion-run-id ID` | Opt in to lifecycle v1 using the caller's correlation ID. |
+| `--second-opinion-lifecycle PATH` | Append flushed, content-free JSONL lifecycle records at `PATH`. |
+| `--second-opinion-inference-seconds N` | Set the authoritative launch-relative inference deadline. |
+| `--second-opinion-normal-cleanup-seconds N` | Override the 10-second normal cleanup grace (primarily for tests). |
+| `--second-opinion-forced-cleanup-seconds N` | Override the 5-second forced cleanup bound (primarily for tests). |
 
 Everything else is passed through to `claude` after `--session-id <UUID> --settings <hook-json>`. So `claude-pee --permission-mode plan -p hi` becomes:
 
@@ -69,6 +81,14 @@ claude --session-id <UUID> --settings '<json>' --permission-mode plan
 | `stream-json` | Every transcript line as it lands, verbatim. |
 
 Diagnostic logs go to **stderr** via [`log`](https://docs.rs/log) + `env_logger`. Default level `info` (silent). Set `RUST_LOG=debug` for the per-line tailer trace; `RUST_LOG=trace` also surfaces "tailing &lt;path&gt;" and "injecting /exit".
+
+Lifecycle JSONL never contains prompts, review text, thinking, tool results, or
+artifact content. Its required phases are `launched`, `prompt_submitted`,
+`output_observed`, `output_complete`, `cleanup_started`, and `terminated`;
+terminal outcomes are `completed_clean`, `completed_forced_cleanup`,
+`failed_incomplete`, and `cleanup_failed`. Review text remains exclusively on
+stdout and, in lifecycle mode, is withheld unless process-group cleanup is
+verified.
 
 ## Environment variables
 
@@ -102,6 +122,14 @@ Diagnostic logs go to **stderr** via [`log`](https://docs.rs/log) + `env_logger`
 4. claude-pee sees the sentinel appear, sends `/exit\r\n`, and waits for the child to exit.
 
 5. The sentinel is removed on exit via an RAII guard (even on error/panic paths).
+
+In lifecycle mode the Stop hook is the preferred cleanup signal, not proof that
+the review is complete. The wrapper starts its monotonic inference clock at
+child spawn. After semantic completion it allows 10 seconds for normal
+shutdown, then terminates the spawned process group and allows at most 5 more
+seconds to verify absence and drain the transcript. Verified forced cleanup
+returns the review once with `completed_forced_cleanup`; unverified cleanup
+returns `cleanup_failed` and no review text.
 
 ## Examples
 

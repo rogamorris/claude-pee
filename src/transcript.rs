@@ -3,12 +3,20 @@
 use std::io::{self, BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::Sender;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use log::{debug, error, trace};
 
 use crate::args::OutputFormat;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Observation {
+    pub text: String,
+    pub complete: bool,
+    pub elapsed: Duration,
+}
 
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
 
@@ -48,6 +56,30 @@ fn extract_message_text(json: &serde_json::Value) -> String {
         return out;
     }
     content.as_str().unwrap_or("").to_owned()
+}
+
+pub fn observe_line(line: &str, elapsed: Duration) -> Option<Observation> {
+    let json = serde_json::from_str::<serde_json::Value>(line).ok()?;
+    if json.get("type").and_then(serde_json::Value::as_str) != Some("assistant") {
+        return None;
+    }
+    let message = json.get("message")?;
+    if message.get("type").and_then(serde_json::Value::as_str) != Some("message") {
+        return None;
+    }
+    let text = extract_message_text(&json);
+    if text.trim().is_empty() {
+        return None;
+    }
+    let complete = message
+        .get("stop_reason")
+        .and_then(serde_json::Value::as_str)
+        == Some("end_turn");
+    Some(Observation {
+        text,
+        complete,
+        elapsed,
+    })
 }
 
 /// Process a single jsonl line against the requested output format. Two
@@ -118,7 +150,13 @@ fn handle_line(line: &str, format: OutputFormat) -> io::Result<()> {
     Ok(())
 }
 
-fn tail(path: &Path, format: OutputFormat, stop: &AtomicBool) -> io::Result<()> {
+fn tail(
+    path: &Path,
+    format: OutputFormat,
+    stop: &AtomicBool,
+    observations: Option<&Sender<Observation>>,
+    start: Option<Instant>,
+) -> io::Result<()> {
     let file = std::fs::File::open(path)?;
     let mut reader = BufReader::new(file);
     let mut pending = String::new();
@@ -147,7 +185,14 @@ fn tail(path: &Path, format: OutputFormat, stop: &AtomicBool) -> io::Result<()> 
         pending.clear();
         let preview: String = line.chars().take(200).collect();
         debug!("line[{line_no}] ({} bytes): {preview}", line.len());
-        handle_line(&line, format)?;
+        if let (Some(sender), Some(started)) = (observations, start)
+            && let Some(observation) = observe_line(&line, started.elapsed())
+        {
+            drop(sender.send(observation));
+        }
+        if observations.is_none() {
+            handle_line(&line, format)?;
+        }
     }
 }
 
@@ -165,7 +210,68 @@ pub fn run(session_id: &str, format: OutputFormat, stop: &AtomicBool) {
         thread::sleep(POLL_INTERVAL);
     };
     trace!("tailing {}", path.display());
-    if let Err(e) = tail(&path, format, stop) {
+    if let Err(e) = tail(&path, format, stop, None, None) {
         error!("tail error: {e}");
+    }
+}
+
+pub fn run_observed(
+    session_id: &str,
+    format: OutputFormat,
+    stop: &AtomicBool,
+    observations: &Sender<Observation>,
+    start: Instant,
+) {
+    let path = loop {
+        if let Some(path) = find(session_id) {
+            break path;
+        }
+        if stop.load(Ordering::Relaxed) {
+            return;
+        }
+        thread::sleep(POLL_INTERVAL);
+    };
+    if let Err(error) = tail(&path, format, stop, Some(observations), Some(start)) {
+        error!("tail error: {error}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Observation, observe_line};
+
+    #[test]
+    fn terminal_end_turn_text_is_complete() {
+        let line = r#"{"type":"assistant","message":{"type":"message","stop_reason":"end_turn","content":[{"type":"text","text":"Review"}]}}"#;
+        assert_eq!(
+            observe_line(line, std::time::Duration::from_secs(1)),
+            Some(Observation {
+                text: "Review".to_owned(),
+                complete: true,
+                elapsed: std::time::Duration::from_secs(1),
+            })
+        );
+    }
+
+    #[test]
+    fn tool_use_turn_with_text_is_observed_but_not_complete() {
+        let line = r#"{"type":"assistant","message":{"type":"message","stop_reason":"tool_use","content":[{"type":"text","text":"Checking"},{"type":"tool_use","name":"Read"}]}}"#;
+        assert_eq!(
+            observe_line(line, std::time::Duration::from_secs(1)),
+            Some(Observation {
+                text: "Checking".to_owned(),
+                complete: false,
+                elapsed: std::time::Duration::from_secs(1),
+            })
+        );
+    }
+
+    #[test]
+    fn thinking_tool_results_empty_text_and_malformed_lines_are_not_observed() {
+        let elapsed = std::time::Duration::ZERO;
+        assert!(observe_line(r#"{"type":"assistant","message":{"type":"message","stop_reason":"end_turn","content":[{"type":"thinking","thinking":"private"}]}}"#, elapsed).is_none());
+        assert!(observe_line(r#"{"type":"tool_result","content":"private"}"#, elapsed).is_none());
+        assert!(observe_line(r#"{"type":"assistant","message":{"type":"message","stop_reason":"end_turn","content":[{"type":"text","text":"  "}]}}"#, elapsed).is_none());
+        assert!(observe_line("not json", elapsed).is_none());
     }
 }

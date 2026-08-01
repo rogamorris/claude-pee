@@ -11,6 +11,10 @@ use std::time::Instant;
 
 use portable_pty::{CommandBuilder, PtySize};
 
+use nix::errno::Errno;
+use nix::sys::signal::{Signal, kill};
+use nix::unistd::Pid;
+
 pub const PTY_SIZE: PtySize = PtySize {
     rows: 24,
     cols: 80,
@@ -80,4 +84,25 @@ pub fn drain<R: Read>(mut reader: R, start: Instant, last_change_us: &AtomicU64)
         }
     }
     Ok(())
+}
+
+fn group_pid(process_id: u32) -> io::Result<Pid> {
+    let pid = i32::try_from(process_id)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+    Ok(Pid::from_raw(pid.saturating_neg()))
+}
+
+pub fn terminate_process_group(process_id: u32, signal: Signal) -> io::Result<()> {
+    match kill(group_pid(process_id)?, signal) {
+        Ok(()) | Err(Errno::ESRCH) => Ok(()),
+        Err(error) => Err(io::Error::other(error)),
+    }
+}
+
+pub fn process_group_absent(process_id: u32) -> io::Result<bool> {
+    match kill(group_pid(process_id)?, None) {
+        Err(Errno::ESRCH) => Ok(true),
+        Ok(()) | Err(Errno::EPERM) => Ok(false),
+        Err(error) => Err(io::Error::other(error)),
+    }
 }

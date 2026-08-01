@@ -12,6 +12,15 @@ use crate::hook;
 
 const DEFAULT_QUIESCE_MS: u64 = 500;
 
+#[derive(Debug)]
+pub struct SecondOpinionConfig {
+    pub run_id: String,
+    pub lifecycle_path: PathBuf,
+    pub inference: Duration,
+    pub normal_cleanup: Duration,
+    pub forced_cleanup: Duration,
+}
+
 /// Read a non-negative integer env var into a `Duration`. Returns
 /// `Duration::ZERO` if unset or unparseable.
 fn read_ms(name: &str) -> Duration {
@@ -40,12 +49,27 @@ pub struct Config {
     pub quiesce: Duration,
     pub sentinel: PathBuf,
     pub settings_json: String,
+    pub second_opinion: Option<SecondOpinionConfig>,
 }
 
 impl Config {
     /// Resolve everything: mint a session UUID, derive the sentinel path
     /// and the `--settings` JSON, pick up the timing knobs from env.
     pub fn build(parsed: ParsedArgs) -> Self {
+        let second_opinion = match (
+            parsed.run_id,
+            parsed.lifecycle_path,
+            parsed.inference_seconds,
+        ) {
+            (Some(run_id), Some(path), Some(inference_seconds)) => Some(SecondOpinionConfig {
+                run_id,
+                lifecycle_path: PathBuf::from(path),
+                inference: Duration::from_secs(inference_seconds),
+                normal_cleanup: Duration::from_secs(parsed.normal_cleanup_seconds),
+                forced_cleanup: Duration::from_secs(parsed.forced_cleanup_seconds),
+            }),
+            _ => None,
+        };
         let session_id = Uuid::new_v4().to_string();
         let sentinel = hook::sentinel_path(&session_id);
         let settings_json = hook::stop_hook_settings(&sentinel);
@@ -58,6 +82,7 @@ impl Config {
             quiesce: quiesce(),
             sentinel,
             settings_json,
+            second_opinion,
         }
     }
 }

@@ -4,6 +4,7 @@
 use std::io::{self, Write};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::mpsc::Sender;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -72,6 +73,7 @@ pub struct Ctx<'a> {
     pub stop: &'a AtomicBool,
     pub sentinel: &'a Path,
     pub quiesce: Duration,
+    pub prompt_submitted: Option<Sender<()>>,
 }
 
 /// Drive the child end-to-end:
@@ -94,6 +96,11 @@ pub fn run(mut ctx: Ctx<'_>) -> io::Result<()> {
     prompt.push_str(ctx.payload);
     prompt.push('\r');
     write_payload(&mut ctx.writer, &prompt, ctx.char_delay)?;
+    if let Some(sender) = &ctx.prompt_submitted {
+        match sender.send(()) {
+            Ok(()) | Err(_) => {}
+        }
+    }
 
     debug!("waiting for Stop hook sentinel: {}", ctx.sentinel.display());
     if !hook::wait_for_file(ctx.sentinel, ctx.stop)? {
