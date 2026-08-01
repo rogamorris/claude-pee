@@ -18,6 +18,10 @@ pub struct Observation {
     pub elapsed: Duration,
 }
 
+pub const fn completed_within(observation: &Observation, deadline: Duration) -> bool {
+    observation.complete && crate::lifecycle::within_deadline(observation.elapsed, deadline)
+}
+
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 /// Walk `~/.claude/projects/*/` looking for `<session_id>.jsonl`. UUIDs
@@ -80,6 +84,28 @@ pub fn observe_line(line: &str, elapsed: Duration) -> Option<Observation> {
         complete,
         elapsed,
     })
+}
+
+#[cfg(test)]
+mod deadline_tests {
+    use super::{Observation, completed_within};
+    use std::time::Duration;
+
+    fn completed_at(elapsed_ms: u64) -> Observation {
+        Observation {
+            text: "review".to_owned(),
+            complete: true,
+            elapsed: Duration::from_millis(elapsed_ms),
+        }
+    }
+
+    #[test]
+    fn completed_observation_is_accepted_below_and_at_but_not_above_deadline() {
+        let deadline = Duration::from_secs(1);
+        assert!(completed_within(&completed_at(999), deadline));
+        assert!(completed_within(&completed_at(1_000), deadline));
+        assert!(!completed_within(&completed_at(1_001), deadline));
+    }
 }
 
 /// Process a single jsonl line against the requested output format. Two

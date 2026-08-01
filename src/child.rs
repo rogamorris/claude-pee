@@ -3,9 +3,11 @@
 //! detector in [`crate::inject`] can see screen-state changes via
 //! `last_change_us`.
 
+use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
 use std::hash::{DefaultHasher, Hasher};
 use std::io::{self, Read};
+use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
@@ -105,4 +107,77 @@ pub fn process_group_absent(process_id: u32) -> io::Result<bool> {
         Ok(()) | Err(Errno::EPERM) => Ok(false),
         Err(error) => Err(io::Error::other(error)),
     }
+}
+
+pub fn descendant_processes(process_id: u32) -> io::Result<HashSet<u32>> {
+    let executable = std::env::var_os("CLAUDE_PEE_PS_EXEC")
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| OsString::from("ps"));
+    let output = Command::new(executable)
+        .env("CLAUDE_PEE_TRACK_ROOT_PID", process_id.to_string())
+        .args(["-axo", "pid=,ppid="])
+        .output()?;
+    if !output.status.success() {
+        return Err(io::Error::other("process inventory failed"));
+    }
+    let text = String::from_utf8(output.stdout)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    let mut children: HashMap<u32, Vec<u32>> = HashMap::new();
+    for line in text.lines() {
+        let mut fields = line.split_whitespace();
+        let (Some(pid), Some(parent)) = (fields.next(), fields.next()) else {
+            continue;
+        };
+        let (Ok(pid), Ok(parent)) = (pid.parse::<u32>(), parent.parse::<u32>()) else {
+            continue;
+        };
+        children.entry(parent).or_default().push(pid);
+    }
+    let mut descendants = HashSet::new();
+    let mut pending = vec![process_id];
+    while let Some(parent) = pending.pop() {
+        if let Some(direct) = children.get(&parent) {
+            for pid in direct {
+                if descendants.insert(*pid) {
+                    pending.push(*pid);
+                }
+            }
+        }
+    }
+    Ok(descendants)
+}
+
+fn process_absent(process_id: u32) -> io::Result<bool> {
+    let pid = i32::try_from(process_id)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+    match kill(Pid::from_raw(pid), None) {
+        Err(Errno::ESRCH) => Ok(true),
+        Ok(()) | Err(Errno::EPERM) => Ok(false),
+        Err(error) => Err(io::Error::other(error)),
+    }
+}
+
+pub fn terminate_process_tree(process_id: u32, descendants: &HashSet<u32>) -> io::Result<()> {
+    terminate_process_group(process_id, Signal::SIGKILL)?;
+    for descendant in descendants {
+        let pid = i32::try_from(*descendant)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+        match kill(Pid::from_raw(pid), Signal::SIGKILL) {
+            Ok(()) | Err(Errno::ESRCH) => {}
+            Err(error) => return Err(io::Error::other(error)),
+        }
+    }
+    Ok(())
+}
+
+pub fn process_tree_absent(process_id: u32, descendants: &HashSet<u32>) -> io::Result<bool> {
+    if !process_group_absent(process_id)? {
+        return Ok(false);
+    }
+    for descendant in descendants {
+        if !process_absent(*descendant)? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }

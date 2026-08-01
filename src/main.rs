@@ -7,16 +7,17 @@
 //! `--settings`), which touches a sentinel file. Diagnostic logs go to
 //! stderr via the `log` facade — `RUST_LOG=debug` for the tailer trace.
 
+use std::collections::HashSet;
 use std::error::Error;
 use std::io::{self, Write};
 use std::process::ExitCode;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
 use log::{debug, error};
-use nix::sys::signal::Signal;
 use portable_pty::native_pty_system;
 
 mod args;
@@ -86,9 +87,9 @@ fn run() -> Result<u8, BoxError> {
     drop(pty.slave);
 
     let reader = pty.master.try_clone_reader()?;
-    let stop = AtomicBool::new(false);
+    let stop = Arc::new(AtomicBool::new(false));
     let start = Instant::now();
-    let last_change_us = AtomicU64::new(0);
+    let last_change_us = Arc::new(AtomicU64::new(0));
     debug!("child-pid={:?}", spawned.process_id());
 
     if let Some(second_opinion) = &cfg.second_opinion {
@@ -102,43 +103,51 @@ fn run() -> Result<u8, BoxError> {
         )?;
         lifecycle.emit(Phase::Launched, None, "")?;
 
-        let outcome = thread::scope(|scope| -> Result<_, BoxError> {
-            let last_change = &last_change_us;
-            let stop_ref = &stop;
-            scope.spawn(move || child::drain(reader, start, last_change));
+        let outcome = (|| -> Result<_, BoxError> {
+            let last_change = Arc::clone(&last_change_us);
+            drop(thread::spawn(move || {
+                child::drain(reader, start, &last_change)
+            }));
 
             let (observation_tx, observation_rx) = mpsc::channel();
-            let session_id = cfg.session_id.as_str();
-            scope.spawn(move || {
+            let session_id = cfg.session_id.clone();
+            let transcript_stop = Arc::clone(&stop);
+            let output_format = cfg.output_format;
+            drop(thread::spawn(move || {
                 transcript::run_observed(
-                    session_id,
-                    cfg.output_format,
-                    stop_ref,
+                    &session_id,
+                    output_format,
+                    &transcript_stop,
                     &observation_tx,
                     start,
                 );
-            });
+            }));
 
             let (prompt_tx, prompt_rx) = mpsc::channel();
             if let Some(payload) = cfg.inject_payload.as_deref() {
                 let writer = pty.master.take_writer()?;
-                let sentinel = cfg.sentinel.as_path();
-                scope.spawn(move || {
+                let sentinel = cfg.sentinel.clone();
+                let payload = payload.to_owned();
+                let inject_stop = Arc::clone(&stop);
+                let inject_last_change = Arc::clone(&last_change_us);
+                let char_delay = cfg.char_delay;
+                let quiesce = cfg.quiesce;
+                drop(thread::spawn(move || {
                     let ctx = inject::Ctx {
                         writer,
-                        payload,
-                        char_delay: cfg.char_delay,
+                        payload: &payload,
+                        char_delay,
                         start,
-                        last_change_us: last_change,
-                        stop: stop_ref,
-                        sentinel,
-                        quiesce: cfg.quiesce,
+                        last_change_us: &inject_last_change,
+                        stop: &inject_stop,
+                        sentinel: &sentinel,
+                        quiesce,
                         prompt_submitted: Some(prompt_tx),
                     };
                     if let Err(error) = inject::run(ctx) {
                         error!("auto-inject failed: {error}");
                     }
-                });
+                }));
             }
 
             let mut prompt_emitted = false;
@@ -149,6 +158,8 @@ fn run() -> Result<u8, BoxError> {
             let mut forced = false;
             let mut forced_error = false;
             let mut child_exit_code: Option<u32> = None;
+            let mut known_descendants = HashSet::new();
+            let mut tree_tracking_failed = false;
 
             loop {
                 if !prompt_emitted && prompt_rx.try_recv().is_ok() {
@@ -157,12 +168,16 @@ fn run() -> Result<u8, BoxError> {
                 }
 
                 while let Ok(observation) = observation_rx.try_recv() {
+                    if !prompt_emitted && prompt_rx.recv_timeout(Duration::from_millis(50)).is_ok()
+                    {
+                        lifecycle.emit(Phase::PromptSubmitted, None, "")?;
+                        prompt_emitted = true;
+                    }
                     if !output_emitted {
                         lifecycle.emit(Phase::OutputObserved, None, "")?;
                         output_emitted = true;
                     }
-                    if observation.complete
-                        && lifecycle::within_deadline(observation.elapsed, second_opinion.inference)
+                    if transcript::completed_within(&observation, second_opinion.inference)
                         && review.is_none()
                     {
                         lifecycle.emit(Phase::OutputComplete, None, "")?;
@@ -172,23 +187,32 @@ fn run() -> Result<u8, BoxError> {
                     }
                 }
 
+                match child::descendant_processes(process_id) {
+                    Ok(descendants) => known_descendants.extend(descendants),
+                    Err(_) => tree_tracking_failed = true,
+                }
+
                 if let Some(status) = spawned.try_wait()? {
                     child_exit_code = Some(status.exit_code());
                 }
 
-                if child_exit_code.is_some() && child::process_group_absent(process_id)? {
+                if child_exit_code.is_some()
+                    && child::process_tree_absent(process_id, &known_descendants)?
+                {
                     stop.store(true, Ordering::Relaxed);
                     thread::sleep(Duration::from_millis(120));
                     while let Ok(observation) = observation_rx.try_recv() {
+                        if !prompt_emitted
+                            && prompt_rx.recv_timeout(Duration::from_millis(50)).is_ok()
+                        {
+                            lifecycle.emit(Phase::PromptSubmitted, None, "")?;
+                            prompt_emitted = true;
+                        }
                         if !output_emitted {
                             lifecycle.emit(Phase::OutputObserved, None, "")?;
                             output_emitted = true;
                         }
-                        if observation.complete
-                            && lifecycle::within_deadline(
-                                observation.elapsed,
-                                second_opinion.inference,
-                            )
+                        if transcript::completed_within(&observation, second_opinion.inference)
                             && review.is_none()
                         {
                             lifecycle.emit(Phase::OutputComplete, None, "")?;
@@ -202,7 +226,11 @@ fn run() -> Result<u8, BoxError> {
                     if cleanup_started.is_none() {
                         lifecycle.emit(Phase::CleanupStarted, None, "child_exited")?;
                     }
-                    let result = match (review.as_ref(), forced, forced_error) {
+                    let result = match (
+                        review.as_ref(),
+                        forced,
+                        forced_error || tree_tracking_failed,
+                    ) {
                         (Some(_), false, false) => Outcome::CompletedClean,
                         (Some(_), true, false) => Outcome::CompletedForcedCleanup,
                         (Some(_) | None, _, true) => Outcome::CleanupFailed,
@@ -229,7 +257,7 @@ fn run() -> Result<u8, BoxError> {
                     cleanup_started = Some(Instant::now());
                     forced = true;
                     forced_started = Some(Instant::now());
-                    if child::terminate_process_group(process_id, Signal::SIGKILL).is_err() {
+                    if child::terminate_process_tree(process_id, &known_descendants).is_err() {
                         forced_error = true;
                     }
                 }
@@ -238,7 +266,7 @@ fn run() -> Result<u8, BoxError> {
                     if !forced && cleanup_start.elapsed() >= second_opinion.normal_cleanup {
                         forced = true;
                         forced_started = Some(Instant::now());
-                        if child::terminate_process_group(process_id, Signal::SIGKILL).is_err() {
+                        if child::terminate_process_tree(process_id, &known_descendants).is_err() {
                             forced_error = true;
                         }
                     }
@@ -259,7 +287,7 @@ fn run() -> Result<u8, BoxError> {
 
                 thread::sleep(Duration::from_millis(20));
             }
-        })?;
+        })()?;
 
         return Ok(u8::from(!matches!(
             outcome,
@@ -268,8 +296,8 @@ fn run() -> Result<u8, BoxError> {
     }
 
     let status = thread::scope(|scope| -> Result<_, BoxError> {
-        let last_change = &last_change_us;
-        let stop_ref = &stop;
+        let last_change = last_change_us.as_ref();
+        let stop_ref = stop.as_ref();
         scope.spawn(move || child::drain(reader, start, last_change));
         let session_id = cfg.session_id.as_str();
         scope.spawn(move || transcript::run(session_id, cfg.output_format, stop_ref));
