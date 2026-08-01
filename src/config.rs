@@ -65,8 +65,8 @@ impl Config {
                 run_id,
                 lifecycle_path: PathBuf::from(path),
                 inference: Duration::from_secs(inference_seconds),
-                normal_cleanup: Duration::from_secs(parsed.normal_cleanup_seconds),
-                forced_cleanup: Duration::from_secs(parsed.forced_cleanup_seconds),
+                normal_cleanup: Duration::from_secs(parsed.normal_cleanup_seconds.unwrap_or(10)),
+                forced_cleanup: Duration::from_secs(parsed.forced_cleanup_seconds.unwrap_or(5)),
             }),
             _ => None,
         };

@@ -58,8 +58,8 @@ pub struct ParsedArgs {
     pub run_id: Option<String>,
     pub lifecycle_path: Option<OsString>,
     pub inference_seconds: Option<u64>,
-    pub normal_cleanup_seconds: u64,
-    pub forced_cleanup_seconds: u64,
+    pub normal_cleanup_seconds: Option<u64>,
+    pub forced_cleanup_seconds: Option<u64>,
 }
 
 fn positive_integer(value: OsString, flag: &'static str) -> Result<u64, ParseError> {
@@ -80,8 +80,8 @@ pub fn parse<I: IntoIterator<Item = OsString>>(argv: I) -> Result<ParsedArgs, Pa
     let mut run_id = None;
     let mut lifecycle_path = None;
     let mut inference_seconds = None;
-    let mut normal_cleanup_seconds = 10;
-    let mut forced_cleanup_seconds = 5;
+    let mut normal_cleanup_seconds = None;
+    let mut forced_cleanup_seconds = None;
     let mut iter = argv.into_iter();
     while let Some(arg) = iter.next() {
         match arg.to_str() {
@@ -124,20 +124,20 @@ pub fn parse<I: IntoIterator<Item = OsString>>(argv: I) -> Result<ParsedArgs, Pa
                 )?);
             }
             Some("--second-opinion-normal-cleanup-seconds") => {
-                normal_cleanup_seconds = positive_integer(
+                normal_cleanup_seconds = Some(positive_integer(
                     iter.next().ok_or(ParseError::MissingValue(
                         "--second-opinion-normal-cleanup-seconds",
                     ))?,
                     "--second-opinion-normal-cleanup-seconds",
-                )?;
+                )?);
             }
             Some("--second-opinion-forced-cleanup-seconds") => {
-                forced_cleanup_seconds = positive_integer(
+                forced_cleanup_seconds = Some(positive_integer(
                     iter.next().ok_or(ParseError::MissingValue(
                         "--second-opinion-forced-cleanup-seconds",
                     ))?,
                     "--second-opinion-forced-cleanup-seconds",
-                )?;
+                )?);
             }
             _ => forwarded.push(arg),
         }
@@ -283,8 +283,8 @@ mod tests {
         .unwrap();
         assert_eq!(parsed.run_id.as_deref(), Some("run-123"));
         assert_eq!(parsed.inference_seconds, Some(300));
-        assert_eq!(parsed.normal_cleanup_seconds, 10);
-        assert_eq!(parsed.forced_cleanup_seconds, 5);
+        assert_eq!(parsed.normal_cleanup_seconds, Some(10));
+        assert_eq!(parsed.forced_cleanup_seconds, Some(5));
         assert_eq!(parsed.forwarded, osv(&["--model", "claude-fable-5"]));
     }
 

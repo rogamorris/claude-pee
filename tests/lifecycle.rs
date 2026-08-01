@@ -274,3 +274,17 @@ fn cleanup_verification_failure_is_bounded_and_withholds_review() {
     assert!(records.contains("\"outcome\":\"cleanup_failed\""));
     assert!(elapsed < Duration::from_secs(5));
 }
+
+#[test]
+fn cleanup_policy_without_lifecycle_mode_is_rejected() {
+    let output = Command::new(env!("CARGO_BIN_EXE_claude-pee"))
+        .args(["--second-opinion-normal-cleanup-seconds", "1"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("cleanup durations require lifecycle mode")
+    );
+}

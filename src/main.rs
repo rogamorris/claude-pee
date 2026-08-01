@@ -23,12 +23,14 @@ use portable_pty::native_pty_system;
 mod args;
 mod child;
 mod config;
+mod coordinator;
 mod hook;
 mod inject;
 mod lifecycle;
 mod transcript;
 
 use config::Config;
+use coordinator::Coordinator;
 use lifecycle::{Emitter, Outcome, Phase};
 
 type BoxError = Box<dyn Error + Send + Sync + 'static>;
@@ -53,12 +55,21 @@ fn run() -> Result<u8, BoxError> {
         parsed.lifecycle_path.is_some(),
         parsed.inference_seconds.is_some(),
     ];
+    let cleanup_policy_supplied =
+        parsed.normal_cleanup_seconds.is_some() || parsed.forced_cleanup_seconds.is_some();
     if lifecycle_fields.iter().any(|present| *present)
         && !lifecycle_fields.iter().all(|present| *present)
     {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "second-opinion run id, lifecycle path, and inference duration must be supplied together",
+        )
+        .into());
+    }
+    if cleanup_policy_supplied && !lifecycle_fields.iter().all(|present| *present) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "second-opinion cleanup durations require lifecycle mode",
         )
         .into());
     }
@@ -150,10 +161,7 @@ fn run() -> Result<u8, BoxError> {
                 }));
             }
 
-            let mut prompt_emitted = false;
-            let mut output_emitted = false;
-            let mut review: Option<String> = None;
-            let mut cleanup_started: Option<Instant> = None;
+            let mut coordinator = Coordinator::new();
             let mut forced_started: Option<Instant> = None;
             let mut forced = false;
             let mut forced_error = false;
@@ -162,30 +170,19 @@ fn run() -> Result<u8, BoxError> {
             let mut tree_tracking_failed = false;
 
             loop {
-                if cleanup_started.is_none() && !prompt_emitted && prompt_rx.try_recv().is_ok() {
-                    lifecycle.emit(Phase::PromptSubmitted, None, "")?;
-                    prompt_emitted = true;
-                }
+                coordinator.emit_prompt_if_ready(&prompt_rx, &mut lifecycle)?;
 
-                while cleanup_started.is_none()
+                while coordinator.cleanup_started().is_none()
                     && let Ok(observation) = observation_rx.try_recv()
                 {
-                    if !prompt_emitted && prompt_rx.recv_timeout(Duration::from_millis(50)).is_ok()
-                    {
-                        lifecycle.emit(Phase::PromptSubmitted, None, "")?;
-                        prompt_emitted = true;
-                    }
-                    if !output_emitted {
-                        lifecycle.emit(Phase::OutputObserved, None, "")?;
-                        output_emitted = true;
-                    }
-                    if transcript::completed_within(&observation, second_opinion.inference)
-                        && review.is_none()
-                    {
-                        lifecycle.emit(Phase::OutputComplete, None, "")?;
-                        lifecycle.emit(Phase::CleanupStarted, None, "")?;
-                        review = Some(observation.text);
-                        cleanup_started = Some(Instant::now());
+                    coordinator.record_observation(
+                        observation,
+                        &prompt_rx,
+                        &mut lifecycle,
+                        second_opinion.inference,
+                    )?;
+                    if coordinator.review().is_some() {
+                        coordinator.begin_cleanup(&mut lifecycle, "")?;
                     }
                 }
 
@@ -204,32 +201,16 @@ fn run() -> Result<u8, BoxError> {
                     stop.store(true, Ordering::Relaxed);
                     thread::sleep(Duration::from_millis(120));
                     while let Ok(observation) = observation_rx.try_recv() {
-                        if !prompt_emitted
-                            && prompt_rx.recv_timeout(Duration::from_millis(50)).is_ok()
-                        {
-                            lifecycle.emit(Phase::PromptSubmitted, None, "")?;
-                            prompt_emitted = true;
-                        }
-                        if !output_emitted {
-                            lifecycle.emit(Phase::OutputObserved, None, "")?;
-                            output_emitted = true;
-                        }
-                        if transcript::completed_within(&observation, second_opinion.inference)
-                            && review.is_none()
-                        {
-                            lifecycle.emit(Phase::OutputComplete, None, "")?;
-                            if cleanup_started.is_none() {
-                                lifecycle.emit(Phase::CleanupStarted, None, "child_exited")?;
-                                cleanup_started = Some(Instant::now());
-                            }
-                            review = Some(observation.text);
-                        }
+                        coordinator.record_observation(
+                            observation,
+                            &prompt_rx,
+                            &mut lifecycle,
+                            second_opinion.inference,
+                        )?;
                     }
-                    if cleanup_started.is_none() {
-                        lifecycle.emit(Phase::CleanupStarted, None, "child_exited")?;
-                    }
+                    coordinator.begin_cleanup(&mut lifecycle, "child_exited")?;
                     let result = match (
-                        review.as_ref(),
+                        coordinator.review(),
                         forced,
                         forced_error || tree_tracking_failed,
                     ) {
@@ -242,7 +223,7 @@ fn run() -> Result<u8, BoxError> {
                     if matches!(
                         result,
                         Outcome::CompletedClean | Outcome::CompletedForcedCleanup
-                    ) && let Some(text) = review
+                    ) && let Some(text) = coordinator.take_review()
                     {
                         let mut stdout = io::stdout().lock();
                         writeln!(stdout, "{text}")?;
@@ -251,32 +232,21 @@ fn run() -> Result<u8, BoxError> {
                     return Ok(result);
                 }
 
-                if review.is_none()
-                    && cleanup_started.is_none()
+                if coordinator.review().is_none()
+                    && coordinator.cleanup_started().is_none()
                     && start.elapsed() > second_opinion.inference
                 {
                     stop.store(true, Ordering::Relaxed);
                     thread::sleep(Duration::from_millis(120));
                     while let Ok(observation) = observation_rx.try_recv() {
-                        if !prompt_emitted
-                            && prompt_rx.recv_timeout(Duration::from_millis(50)).is_ok()
-                        {
-                            lifecycle.emit(Phase::PromptSubmitted, None, "")?;
-                            prompt_emitted = true;
-                        }
-                        if !output_emitted {
-                            lifecycle.emit(Phase::OutputObserved, None, "")?;
-                            output_emitted = true;
-                        }
-                        if transcript::completed_within(&observation, second_opinion.inference)
-                            && review.is_none()
-                        {
-                            lifecycle.emit(Phase::OutputComplete, None, "")?;
-                            review = Some(observation.text);
-                        }
+                        coordinator.record_observation(
+                            observation,
+                            &prompt_rx,
+                            &mut lifecycle,
+                            second_opinion.inference,
+                        )?;
                     }
-                    lifecycle.emit(Phase::CleanupStarted, None, "inference_deadline")?;
-                    cleanup_started = Some(Instant::now());
+                    coordinator.begin_cleanup(&mut lifecycle, "inference_deadline")?;
                     forced = true;
                     forced_started = Some(Instant::now());
                     if child::terminate_process_tree(process_id, &known_descendants).is_err() {
@@ -284,7 +254,7 @@ fn run() -> Result<u8, BoxError> {
                     }
                 }
 
-                if let Some(cleanup_start) = cleanup_started {
+                if let Some(cleanup_start) = coordinator.cleanup_started() {
                     if !forced && cleanup_start.elapsed() >= second_opinion.normal_cleanup {
                         forced = true;
                         forced_started = Some(Instant::now());
